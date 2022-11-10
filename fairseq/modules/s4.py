@@ -201,7 +201,7 @@ class S4(nn.Module):
         w = w * dt
         # Stack B and p, C and q for convenient batching
         B = torch.cat([B.unsqueeze(0), P], dim=-3)  # (B+1+R, H, N)
-        C = torch.cat([C.unsqueeze(0), Q], dim=-3)  # (C+R, H, N)
+        C = torch.cat([C.unsqueeze(0), Q], dim=-3) * self.scale # (C+R, H, N)
 
         # Incorporate B and C batch dimensions
         v = B.unsqueeze(-3) * C.unsqueeze(-4)  # (B+1+R, C+R, H, N)
