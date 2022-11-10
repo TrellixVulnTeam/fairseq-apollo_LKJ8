@@ -15,6 +15,16 @@ _c2r = torch.view_as_real
 _r2c = torch.view_as_complex
 
 
+def cauchy_naive(v, z, w):
+    """
+    v, w: (..., N)
+    z: (..., L)
+    returns: (..., L)
+    """
+    cauchy_matrix = v.unsqueeze(-1) / (z.unsqueeze(-2) - w.unsqueeze(-1))  # (... N L)
+    return torch.sum(cauchy_matrix, dim=-2)
+
+
 @with_incremental_state
 class S4(nn.Module):
     def __init__(
@@ -30,14 +40,16 @@ class S4(nn.Module):
         self.bidirectional = bidirectional
         self.dt_max = 0.1
         self.dt_min = 0.001
+        self.rank = 1
         self.disc = disc
         self.scale = math.sqrt(1.0 / self.ndim)
 
         kernel_dim = 2 * embed_dim if self.bidirectional else embed_dim
         self.log_dt = nn.Parameter(Tensor(kernel_dim, 1))
-        self.log_A_real = nn.Parameter(Tensor(kernel_dim, ndim))
-        self.A_imaginary = nn.Parameter(Tensor(kernel_dim, ndim))
+        self.log_w_real = nn.Parameter(Tensor(kernel_dim, ndim))
+        self.w_imaginary = nn.Parameter(Tensor(kernel_dim, ndim))
         self.B = nn.Parameter(Tensor(kernel_dim, ndim, 2))
+        self.P = nn.Parameter(Tensor(self.rank, kernel_dim, ndim, 2))
         self.C = nn.Parameter(Tensor(kernel_dim, ndim, 2))
         self.D = nn.Parameter(Tensor(embed_dim))
 
@@ -73,7 +85,7 @@ class S4(nn.Module):
             P = torch.cat([P, torch.zeros(rank - d, N, dtype=dtype)], dim=0)  # (rank N)
         return P
 
-    def nplr(self, N, rank=1, dtype=torch.float16, diagonalize_precision=True):
+    def nplr(self, N, rank=1, dtype=torch.float, diagonalize_precision=True):
         assert dtype == torch.float or dtype == torch.double
         cdtype = torch.cfloat if dtype == torch.float else torch.cdouble
 
@@ -140,11 +152,92 @@ class S4(nn.Module):
         with torch.no_grad():
             self.log_dt.copy_(log_dt)
 
-        w, P, B, V = self.nplr(self.ndim * 2, rank=1)
+        N = self.ndim * 2
+        H = self.P.size(0)
+        w, P, B, V = self.nplr(N, rank=self.rank)
+        w = w.unsqueeze(0).expand(H, self.ndim)
+        P = P.unsqueeze(1).expand(self.rank, H, self.ndim)
+        B = B.unsqueeze(0).expand(H, self.ndim)
+        V = V.unsqueeze(0).expand(H, N, self.ndim)
 
         C = _c2r(torch.randn(self.ndim, dtype=torch.cfloat))
         with torch.no_grad():
+            self.P.copy_(P)
             self.B.copy_(B)
             self.C.copy_(C)
+            self.log_w_real.copy_(torch.log(-w.real))
+            self.w_imaginary.copy_(w.imag)
 
         nn.init.normal_(self.D, mean=0.0, std=1.0)
+
+    def _w(self):
+        w_real = -torch.exp(self.inv_w_real)
+        w = w_real + 1j * self.w_imaginary
+        return w
+
+    def _omega(self, L, dtype, device):
+        """ Calculate (and cache) FFT nodes and their "unprocessed" version with the bilinear transform
+        This should be called everytime the internal length self.L changes """
+
+        omega = torch.tensor(np.exp(-2j * np.pi / (L)), dtype=dtype, device=device)  # \omega_{2L}
+        omega = omega ** torch.arange(0, L // 2 + 1, device=device)
+        z = 2 * (1 - omega) / (1 + omega)
+        return omega, z
+
+    def compute_kernel(self, L):
+        # H x 1
+        dt = torch.exp(self.log_dt)
+        # H x N
+        B = _r2c(self.B)
+        C = _r2c(self.C)
+        # r x H x N
+        P = _r2c(self.P)
+        Q = P.conj()
+        # H x N
+        w = self._w()
+
+        # Get FFT nodes of right length
+        omega, z = self._omega(L, dtype=w.dtype, device=w.device)
+
+        w = w * dt
+        # Stack B and p, C and q for convenient batching
+        B = torch.cat([B.unsqueeze(0), P], dim=-3)  # (B+1+R, H, N)
+        C = torch.cat([C.unsqueeze(0), Q], dim=-3)  # (C+R, H, N)
+
+        # Incorporate B and C batch dimensions
+        v = B.unsqueeze(-3) * C.unsqueeze(-4)  # (B+1+R, C+R, H, N)
+
+        r = cauchy_naive(v, z, w)
+        r = r * dt[None, None, :]  # (B+1+R, C+R, H, L)
+
+        # Low-rank Woodbury correction
+        if self.rank == 1:
+            k_f = r[:-1, :-1, :, :] - r[:-1, -1:, :, :] * r[-1:, :-1, :, :] / (1 + r[-1:, -1:, :, :])
+        elif self.rank == 2:
+            r00 = r[: -self.rank, : -self.rank, :, :]
+            r01 = r[: -self.rank, -self.rank:, :, :]
+            r10 = r[-self.rank:, : -self.rank, :, :]
+            r11 = r[-self.rank:, -self.rank:, :, :]
+            det = (1 + r11[:1, :1, :, :]) * (1 + r11[1:, 1:, :, :]) - r11[:1, 1:, :, :] * r11[1:, :1, :, :]
+            s = (
+                    r01[:, :1, :, :] * (1 + r11[1:, 1:, :, :]) * r10[:1, :, :, :]
+                    + r01[:, 1:, :, :] * (1 + r11[:1, :1, :, :]) * r10[1:, :, :, :]
+                    - r01[:, :1, :, :] * (r11[:1, 1:, :, :]) * r10[1:, :, :, :]
+                    - r01[:, 1:, :, :] * (r11[1:, :1, :, :]) * r10[:1, :, :, :]
+            )
+            s = s / det
+            k_f = r00 - s
+        else:
+            raise NotImplementedError
+
+        # Final correction for the bilinear transform
+        k_f = k_f * 2 / (1 + omega)
+
+        # Move from frequency to coefficients
+        k = torch.fft.irfft(k_f, n=L)  # (B+1, C, H, L)
+
+        # # Truncate to target length
+        k = k[..., :L]
+        k_B = k[-1, :, :, :]  # (C H L)
+
+        return k_B
