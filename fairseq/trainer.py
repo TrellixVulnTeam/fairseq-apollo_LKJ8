@@ -189,7 +189,7 @@ class Trainer(object):
 
     def _build_optimizer(self):
         def _check_ssm_params(name):
-            suffixes = ['B', 'log_A_real', 'A_imaginary']
+            suffixes = ['B', 'log_A_real', 'A_imaginary', 'inv_w_real', 'w_imaginary', 'P']
             for suffix in suffixes:
                 if name.endswith(suffix):
                     return True

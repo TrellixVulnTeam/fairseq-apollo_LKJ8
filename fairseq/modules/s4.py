@@ -46,7 +46,7 @@ class S4(nn.Module):
 
         kernel_dim = 2 * embed_dim if self.bidirectional else embed_dim
         self.log_dt = nn.Parameter(Tensor(kernel_dim, 1))
-        self.log_w_real = nn.Parameter(Tensor(kernel_dim, ndim))
+        self.inv_w_real = nn.Parameter(Tensor(kernel_dim, ndim))
         self.w_imaginary = nn.Parameter(Tensor(kernel_dim, ndim))
         self.B = nn.Parameter(Tensor(kernel_dim, ndim, 2))
         self.P = nn.Parameter(Tensor(self.rank, kernel_dim, ndim, 2))
@@ -158,14 +158,13 @@ class S4(nn.Module):
         w = w.unsqueeze(0).expand(H, self.ndim)
         P = P.unsqueeze(1).expand(self.rank, H, self.ndim)
         B = B.unsqueeze(0).expand(H, self.ndim)
-        V = V.unsqueeze(0).expand(H, N, self.ndim)
 
         C = _c2r(torch.randn(self.ndim, dtype=torch.cfloat))
         with torch.no_grad():
-            self.P.copy_(P)
-            self.B.copy_(B)
+            self.P.copy_(_c2r(P))
+            self.B.copy_(_c2r(B))
             self.C.copy_(C)
-            self.log_w_real.copy_(torch.log(-w.real))
+            self.inv_w_real.copy_(torch.log(-w.real))
             self.w_imaginary.copy_(w.imag)
 
         nn.init.normal_(self.D, mean=0.0, std=1.0)
@@ -238,6 +237,106 @@ class S4(nn.Module):
 
         # # Truncate to target length
         k = k[..., :L]
-        k_B = k[-1, :, :, :]  # (C H L)
+        k_B = k[-1, 0, :, :]  # (H L)
 
         return k_B
+
+    def kernel(self, length: int):
+        return self.compute_kernel(length)
+
+    def step(self, x, length, hx=None):
+        if length == 1:
+            return self.one_step(x, hx=hx)
+
+        raise NotImplementedError
+
+    def one_step(self, x, hx=None):
+        raise NotImplementedError
+
+    def forward(
+        self,
+        x,
+        padding_mask: Optional[torch.Tensor] = None,
+        incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
+    ) -> Tensor:
+        """Input shape: Time x Batch x Channel
+        Args:
+            padding_mask (ByteTensor, optional): mask to exclude
+                keys that are pads, of shape `(batch, src_len)`, where
+                padding elements are indicated by 1s.
+        """
+
+        seq_len, bsz, embed_dim = x.size()
+        assert embed_dim == self.embed_dim
+
+        # L x B x D
+        residual = x * self.D
+
+        # L x B x D -> B x D x L
+        x = x.permute(1, 2, 0)
+        if padding_mask is not None:
+            x = x * (1.0 - padding_mask.unsqueeze(1).type_as(x))
+
+        assert not self.bidirectional or incremental_state is None, 'Bidirectional S4D does not support incremental state'
+        if incremental_state is not None:
+            saved_state = self._get_input_buffer(incremental_state)
+            if 'prev_state' in saved_state:
+                h = saved_state['prev_state']
+            else:
+                h = None
+            out, h = self.step(x, seq_len, hx=h)
+            saved_state['prev_state'] = h
+            self._set_input_buffer(incremental_state, saved_state)
+            # B x D -> 1 x B x D
+            out = F.silu(out + residual)
+        else:
+            # D x L
+            k = self.kernel(seq_len)
+            fft_len = seq_len
+            s = 0
+            kernel_size = k.size(1)
+            if self.bidirectional:
+                k1, k2 = torch.split(k, [self.embed_dim, self.embed_dim], dim=0)
+                # D x 2*L-1
+                k = F.pad(k1, (kernel_size - 1, 0)) + F.pad(k2.flip(-1), (0, kernel_size - 1))
+                x = F.pad(x, (kernel_size - 1, 0))
+                fft_len = fft_len + kernel_size - 1
+                s = 2 * kernel_size - 2
+
+            k_f = torch.fft.rfft(k.float(), n=2 * fft_len)
+            x_f = torch.fft.rfft(x.float(), n=2 * fft_len)
+            # B x D x L
+            out = torch.fft.irfft(x_f * k_f, n=2 * fft_len)[..., s:s + seq_len]
+            out = out.type_as(x)
+            # B x D x L -> L x B x D
+            out = F.silu(out.permute(2, 0, 1) + residual)
+
+        return out
+
+    def _get_input_buffer(self, incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]]) -> Dict[str, Optional[Tensor]]:
+        result = self.get_incremental_state(incremental_state, "ema_state")
+        if result is not None:
+            return result
+        else:
+            empty_result: Dict[str, Optional[Tensor]] = {}
+            return empty_result
+
+    def _set_input_buffer(self, incremental_state: Dict[str, Dict[str, Optional[Tensor]]], buffer: Dict[str, Optional[Tensor]]):
+        return self.set_incremental_state(incremental_state, "ema_state", buffer)
+
+    @torch.jit.export
+    def reorder_incremental_state(
+            self, incremental_state: Dict[str, Dict[str, Optional[Tensor]]], new_order: Tensor
+    ):
+        """Reorder buffered internal state (for incremental generation)."""
+        input_buffer = self._get_input_buffer(incremental_state)
+        if input_buffer is not None:
+            for k in input_buffer.keys():
+                input_buffer_k = input_buffer[k]
+                if input_buffer_k is not None:
+                    input_buffer[k] = input_buffer_k.index_select(0, new_order)
+            incremental_state = self._set_input_buffer(incremental_state, input_buffer)
+        return incremental_state
+
+    def extra_repr(self) -> str:
+        return 'edim={}, ndim={}, bidirectional={}, rank={}'.format(self.embed_dim, self.ndim, self.bidirectional, self.rank)
