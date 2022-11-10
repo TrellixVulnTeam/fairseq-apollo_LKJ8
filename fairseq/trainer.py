@@ -188,12 +188,28 @@ class Trainer(object):
         return self._lr_scheduler
 
     def _build_optimizer(self):
-        params = list(
-            filter(
-                lambda p: p.requires_grad,
-                chain(self.model.parameters(), self.criterion.parameters()),
-            )
-        )
+        def _check_ssm_params(name):
+            suffixes = ['B', 'log_A_real', 'A_imaginary']
+            for suffix in suffixes:
+                if name.endswith(suffix):
+                    return True
+            return False
+
+        def _get_ssm_params(model):
+            decay = []
+            no_decay = []
+            for name, param in model.named_parameters():
+                if not param.requires_grad:
+                    continue  # frozen weights
+
+                if _check_ssm_params(name):
+                    print("ssm param: {}".format(name))
+                    no_decay.append(param)
+                else:
+                    decay.append(param)
+            return [{'params': no_decay, 'lr': 0.001, 'weight_decay': 0.}, {'params': decay}]
+
+        params = _get_ssm_params(self.model)
 
         if self.args.fp16 or self.args.bf16:
             if self.cuda and torch.cuda.get_device_capability(0)[0] < 7:
